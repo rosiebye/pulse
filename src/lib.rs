@@ -7,5 +7,15 @@
 //!
 //! ## What is Pulse?
 //!
-//! Pulse is a game engine in the **very** early stages of development (it's pretty empty here right
-//! now).
+//! Pulse is an ambitious game engine in the **very** early stages of development (it's pretty empty
+//! here right now). Planned features include:
+//! - Render graphs for building custom rendering pipeline and effects
+//! - Physically based rendering
+//! - Image based lighting
+//! - Custom material system
+//! - Scripting engine
+//! - Integrating with existing physics libraries
+//! - UI
+//! - Editor
+//! - Asset management system
+//! - Mouse, keyboard, and gamepad input
