@@ -3,6 +3,9 @@ use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoop;
 use winit::window::WindowBuilder;
 
+use crate::components::WorldTransform;
+use crate::systems;
+use crate::ComputedVisibility;
 use crate::Scene;
 
 /// # Application
@@ -68,6 +71,20 @@ fn run_application(mut app: impl Application) {
                 },
                 winit::event::Event::AboutToWait => {
                     app.update();
+
+                    let scene = app.scene();
+                    systems::compute_visibility(scene);
+                    systems::compute_world_transform(scene);
+
+                    for event in scene.events::<ComputedVisibility>().iter() {
+                        println!("Computed Visibility: {event:?}");
+                    }
+
+                    for event in scene.events::<WorldTransform>().iter() {
+                        println!("World Transform: {event:?}");
+                    }
+
+                    scene.clear_events();
 
                     let title = app.title();
                     if title != &window_title {

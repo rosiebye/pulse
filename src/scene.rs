@@ -1,5 +1,7 @@
 use std::any::Any;
 use std::any::TypeId;
+use std::cell::Ref;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -10,12 +12,16 @@ use nohash::IntSet;
 static ALLOCATOR: AtomicUsize = AtomicUsize::new(1);
 
 /// # Component
-pub trait Component: 'static + Clone {}
+pub trait Component: 'static + Clone + PartialEq {}
 
+/// # Component Event
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ComponentEvent {
+    /// Component was added to the node.
     Added(Node),
+    /// Component was modified for node.
     Modified(Node),
+    /// Component was removed from node.
     Removed(Node),
 }
 
@@ -42,8 +48,6 @@ trait DynamicComponentTable {
 
     fn remove(&mut self, node: Node);
 
-    fn events(&self) -> &[ComponentEvent];
-
     fn clear_events(&mut self);
 }
 
@@ -53,7 +57,7 @@ struct ComponentTable<T> {
     events: Vec<ComponentEvent>,
 }
 
-impl<T> ComponentTable<T> {
+impl<T: Component> ComponentTable<T> {
     fn new() -> Self {
         Self {
             node_indexes: IntMap::default(),
@@ -79,8 +83,10 @@ impl<T> ComponentTable<T> {
 
     fn set(&mut self, node: Node, value: T) {
         if let Some(index) = self.node_indexes.get(&node) {
-            self.items[*index] = value;
-            self.events.push(ComponentEvent::Modified(node));
+            if self.items[*index] != value {
+                self.items[*index] = value;
+                self.events.push(ComponentEvent::Modified(node));
+            }
         }
     }
 
@@ -123,10 +129,6 @@ impl<T: Component> DynamicComponentTable for ComponentTable<T> {
         self.remove(node);
     }
 
-    fn events(&self) -> &[ComponentEvent] {
-        self.events()
-    }
-
     fn clear_events(&mut self) {
         self.clear_events();
     }
@@ -137,8 +139,8 @@ pub struct Scene {
     nodes: IntSet<Node>,
     parents: IntMap<Node, Node>,
     children: IntMap<Node, Vec<Node>>,
-    component_indexes: BTreeMap<TypeId, usize>,
-    component_tables: Vec<Box<dyn DynamicComponentTable>>,
+    component_indexes: RefCell<BTreeMap<TypeId, usize>>,
+    component_tables: RefCell<Vec<Box<dyn DynamicComponentTable>>>,
 }
 
 impl Scene {
@@ -148,8 +150,8 @@ impl Scene {
             nodes: IntSet::default(),
             parents: IntMap::default(),
             children: IntMap::default(),
-            component_indexes: BTreeMap::new(),
-            component_tables: Vec::new(),
+            component_indexes: RefCell::new(BTreeMap::new()),
+            component_tables: RefCell::new(Vec::new()),
         }
     }
 
@@ -172,7 +174,7 @@ impl Scene {
                 &mut self.nodes,
                 &mut self.parents,
                 &mut self.children,
-                &mut self.component_tables,
+                &mut self.component_tables.borrow_mut(),
                 node,
             );
             self.remove_parent(node);
@@ -246,26 +248,37 @@ impl Scene {
         }
     }
 
+    /// Returns the root nodes i.e. nodes that don't have a parent.
+    pub fn get_root_nodes<'a>(&'a self) -> impl 'a + Iterator<Item = Node> {
+        self.nodes
+            .iter()
+            .copied()
+            .filter(|node| self.get_parent(*node).is_none())
+    }
+
     /// Returns the children for the given node.
     pub fn get_children(&self, node: Node) -> Option<&[Node]> {
         self.children.get(&node).map(Vec::as_slice)
     }
 
     /// Adds the component to the node.
-    pub fn add<T: Component>(&mut self, node: Node, value: T) {
+    pub fn add<T: Component>(&self, node: Node, value: T) {
         let component_index = match self.component_index::<T>() {
             Some(index) => index,
             None => {
-                let index = self.component_tables.len();
-                self.component_indexes.insert(TypeId::of::<T>(), index);
+                let index = self.component_tables.borrow().len();
+                self.component_indexes
+                    .borrow_mut()
+                    .insert(TypeId::of::<T>(), index);
                 self.component_tables
+                    .borrow_mut()
                     .push(Box::new(ComponentTable::<T>::new()));
 
                 index
             }
         };
 
-        self.component_tables[component_index]
+        self.component_tables.borrow_mut()[component_index]
             .as_any_mut()
             .downcast_mut::<ComponentTable<T>>()
             .unwrap()
@@ -275,7 +288,7 @@ impl Scene {
     /// Returns the component value for the given node.
     pub fn get<T: Component>(&self, node: Node) -> Option<T> {
         if let Some(component_index) = self.component_index::<T>() {
-            self.component_tables[component_index]
+            self.component_tables.borrow()[component_index]
                 .as_any()
                 .downcast_ref::<ComponentTable<T>>()
                 .unwrap()
@@ -287,9 +300,9 @@ impl Scene {
     }
 
     /// Sets the component value for the given node.
-    pub fn set<T: Component>(&mut self, node: Node, value: T) {
+    pub fn set<T: Component>(&self, node: Node, value: T) {
         if let Some(component_index) = self.component_index::<T>() {
-            self.component_tables[component_index]
+            self.component_tables.borrow_mut()[component_index]
                 .as_any_mut()
                 .downcast_mut::<ComponentTable<T>>()
                 .unwrap()
@@ -297,10 +310,16 @@ impl Scene {
         }
     }
 
+    /// Sets the component value for the given node or adds the component.
+    pub fn set_or_add<T: Component>(&self, node: Node, value: T) {
+        self.add(node, value.clone());
+        self.set(node, value);
+    }
+
     /// Removes the component from the given node.
-    pub fn remove<T: Component>(&mut self, node: Node) {
+    pub fn remove<T: Component>(&self, node: Node) {
         if let Some(component_index) = self.component_index::<T>() {
-            self.component_tables[component_index]
+            self.component_tables.borrow_mut()[component_index]
                 .as_any_mut()
                 .downcast_mut::<ComponentTable<T>>()
                 .unwrap()
@@ -309,28 +328,39 @@ impl Scene {
     }
 
     /// Returns the component events for the given component.
-    pub fn events<T: Component>(&self) -> &[ComponentEvent] {
+    pub fn events<T: Component>(&self) -> Ref<[ComponentEvent]> {
         if let Some(component_index) = self.component_index::<T>() {
-            self.component_tables[component_index].events()
+            Ref::map(self.component_tables.borrow(), |table| {
+                table[component_index]
+                    .as_any()
+                    .downcast_ref::<ComponentTable<T>>()
+                    .unwrap()
+                    .events()
+            })
         } else {
-            &[]
+            Ref::map(self.component_tables.borrow(), |_| &[])
         }
     }
 
     /// Clears the component events for all the components.
-    pub fn clear_events(&mut self) {
-        for table in &mut self.component_tables {
+    pub fn clear_events(&self) {
+        for table in self.component_tables.borrow_mut().iter_mut() {
             table.clear_events();
         }
     }
 
     fn component_index<T: Component>(&self) -> Option<usize> {
-        self.component_indexes.get(&TypeId::of::<T>()).copied()
+        self.component_indexes
+            .borrow()
+            .get(&TypeId::of::<T>())
+            .copied()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
+
     use super::*;
 
     impl Component for u32 {}
@@ -544,7 +574,10 @@ mod tests {
 
         scene.add(node, value);
 
-        assert_eq!(scene.events::<u32>(), &[ComponentEvent::Added(node)]);
+        assert_eq!(
+            scene.events::<u32>().deref(),
+            &[ComponentEvent::Added(node)]
+        );
     }
 
     #[test]
@@ -571,8 +604,23 @@ mod tests {
         scene.set(node, new_value);
 
         assert_eq!(
-            scene.events::<u32>(),
+            scene.events::<u32>().deref(),
             &[ComponentEvent::Added(node), ComponentEvent::Modified(node)]
+        );
+    }
+
+    #[test]
+    fn set_existing_value_events_does_not_return_modified_event() {
+        let mut scene = Scene::new();
+        let node = scene.spawn();
+        let value = 17u32;
+        scene.add(node, value);
+
+        scene.set(node, value);
+
+        assert_eq!(
+            scene.events::<u32>().deref(),
+            &[ComponentEvent::Added(node)]
         );
     }
 
@@ -598,7 +646,7 @@ mod tests {
         scene.remove::<u32>(node);
 
         assert_eq!(
-            scene.events::<u32>(),
+            scene.events::<u32>().deref(),
             &[ComponentEvent::Added(node), ComponentEvent::Removed(node)]
         );
     }
@@ -612,6 +660,6 @@ mod tests {
 
         scene.clear_events();
 
-        assert_eq!(scene.events::<u32>(), &[]);
+        assert_eq!(scene.events::<u32>().deref(), &[]);
     }
 }

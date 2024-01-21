@@ -1,7 +1,9 @@
 use pulse::Application;
 use pulse::ApplicationState;
 use pulse::Event;
+use pulse::LocalTransform;
 use pulse::Scene;
+use pulse::Visibility;
 
 struct Playground {
     state: ApplicationState,
@@ -10,9 +12,15 @@ struct Playground {
 
 impl Playground {
     fn new() -> Self {
+        let mut scene = Scene::new();
+
+        let node = scene.spawn();
+        scene.add(node, Visibility::Visible);
+        scene.add(node, LocalTransform::IDENTITY);
+
         Self {
             state: ApplicationState::Running,
-            scene: Scene::new(),
+            scene,
         }
     }
 }

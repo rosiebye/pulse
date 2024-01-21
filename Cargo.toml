@@ -13,5 +13,6 @@ repository = "https://github.com/rosiebye/pulse"
 publish = false
 
 [dependencies]
+glam = "0.25.0"
 nohash = "0.2.0"
 winit = "0.29.10"
