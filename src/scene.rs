@@ -1,5 +1,7 @@
 use std::any::Any;
 use std::any::TypeId;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -9,7 +11,7 @@ static ALLOCATOR: AtomicUsize = AtomicUsize::new(1);
 pub trait Component: 'static + Clone {}
 
 /// # Node
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Node {
     id: usize,
 }
@@ -22,16 +24,6 @@ impl Node {
     }
 }
 
-struct ComponentIndex {
-    type_id: TypeId,
-    index: usize,
-}
-
-struct NodeIndex {
-    node: Node,
-    index: usize,
-}
-
 trait DynamicComponentTable {
     fn as_any(&self) -> &dyn Any;
 
@@ -41,62 +33,52 @@ trait DynamicComponentTable {
 }
 
 struct ComponentTable<T> {
-    node_indexes: Vec<NodeIndex>,
+    node_indexes: BTreeMap<Node, usize>,
     items: Vec<T>,
 }
 
 impl<T> ComponentTable<T> {
     fn new() -> Self {
         Self {
-            node_indexes: Vec::new(),
+            node_indexes: BTreeMap::new(),
             items: Vec::new(),
         }
     }
 
     fn add(&mut self, node: Node, value: T) {
-        if self.node_index(node).is_none() {
+        if !self.node_indexes.contains_key(&node) {
             let index = self.items.len();
-            self.node_indexes.push(NodeIndex { node, index });
+            self.node_indexes.insert(node, index);
             self.items.push(value);
         }
     }
 
     fn get(&self, node: Node) -> Option<&T> {
-        self.node_index(node).map(|index| &self.items[index])
+        self.node_indexes
+            .get(&node)
+            .map(|index| &self.items[*index])
     }
 
     fn set(&mut self, node: Node, value: T) {
-        if let Some(index) = self.node_index(node) {
-            self.items[index] = value;
+        if let Some(index) = self.node_indexes.get(&node) {
+            self.items[*index] = value;
         }
     }
 
     fn remove(&mut self, node: Node) {
-        let index = self
-            .node_indexes
-            .binary_search_by_key(&node.id, |n| n.node.id);
-        if let Ok(index) = index {
-            let node_index = self.node_indexes[index].index;
-            self.items.swap_remove(node_index);
-            self.node_indexes.remove(index);
+        if let Some(index) = self.node_indexes.remove(&node) {
+            self.items.swap_remove(index);
 
-            let moved_node_index = self.items.len();
-            if moved_node_index != node_index {
-                for n in &mut self.node_indexes {
-                    if n.index == moved_node_index {
-                        n.index = node_index;
+            let moved_index = self.items.len();
+            if moved_index != index {
+                for node_index in &mut self.node_indexes.values_mut() {
+                    if *node_index == moved_index {
+                        *node_index = index;
                         break;
                     }
                 }
             }
         }
-    }
-
-    fn node_index(&self, node: Node) -> Option<usize> {
-        self.node_indexes
-            .binary_search_by_key(&node.id, |n| n.node.id)
-            .map(|index| self.node_indexes[index].index)
-            .ok()
     }
 }
 
@@ -116,8 +98,10 @@ impl<T: Component> DynamicComponentTable for ComponentTable<T> {
 
 /// # Scene
 pub struct Scene {
-    nodes: Vec<Node>,
-    component_indexes: Vec<ComponentIndex>,
+    nodes: BTreeSet<Node>,
+    parents: BTreeMap<Node, Node>,
+    children: BTreeMap<Node, Vec<Node>>,
+    component_indexes: BTreeMap<TypeId, usize>,
     component_tables: Vec<Box<dyn DynamicComponentTable>>,
 }
 
@@ -125,34 +109,110 @@ impl Scene {
     /// Returns an empty scene.
     pub const fn new() -> Self {
         Self {
-            nodes: Vec::new(),
-            component_indexes: Vec::new(),
+            nodes: BTreeSet::new(),
+            parents: BTreeMap::new(),
+            children: BTreeMap::new(),
+            component_indexes: BTreeMap::new(),
             component_tables: Vec::new(),
         }
     }
 
     /// Returns true if the scene contains the given node.
     pub fn contains(&self, node: Node) -> bool {
-        self.nodes.binary_search_by_key(&node.id, |n| n.id).is_ok()
+        self.nodes.contains(&node)
     }
 
     /// Creates a new node and adds it to the scene.
     pub fn spawn(&mut self) -> Node {
         let node = Node::new();
-        self.nodes.push(node);
+        self.nodes.insert(node);
         node
     }
 
     /// Removes the given node from the scene.
     pub fn despawn(&mut self, node: Node) {
-        let index = self.nodes.binary_search_by_key(&node.id, |n| n.id);
-        if let Ok(index) = index {
-            self.nodes.remove(index);
+        if self.contains(node) {
+            Self::despawn_internal(
+                &mut self.nodes,
+                &mut self.parents,
+                &mut self.children,
+                &mut self.component_tables,
+                node,
+            );
+            self.remove_parent(node);
+        }
+    }
 
-            for table in &mut self.component_tables {
+    fn despawn_internal(
+        nodes: &mut BTreeSet<Node>,
+        parents: &mut BTreeMap<Node, Node>,
+        children: &mut BTreeMap<Node, Vec<Node>>,
+        component_tables: &mut Vec<Box<dyn DynamicComponentTable>>,
+        node: Node,
+    ) {
+        if nodes.remove(&node) {
+            for child in children.remove(&node).into_iter().flatten() {
+                Self::despawn_internal(nodes, parents, children, component_tables, child);
+            }
+
+            for table in component_tables {
                 table.remove(node);
             }
+
+            parents.remove(&node);
         }
+    }
+
+    /// Returns the parent node for the given node.
+    pub fn get_parent(&self, node: Node) -> Option<Node> {
+        self.parents.get(&node).copied()
+    }
+
+    /// Sets the parent node for the given node. Keeps the existing parent if the given parent
+    /// doesn't exist in the scene or if the given parent would create a node cycle.
+    pub fn set_parent(&mut self, node: Node, parent: Node) {
+        if !self.contains(node) || !self.contains(parent) {
+            return;
+        }
+
+        let mut root = Some(parent);
+        while root.is_some() {
+            if root.unwrap() == node {
+                return;
+            }
+
+            root = self.get_parent(root.unwrap());
+        }
+
+        self.remove_parent(node);
+        self.parents.insert(node, parent);
+
+        if !self.children.contains_key(&parent) {
+            self.children.insert(parent, Vec::new());
+        }
+
+        self.children.get_mut(&parent).unwrap().push(node);
+    }
+
+    /// Removes the parent node for the given node.
+    pub fn remove_parent(&mut self, node: Node) {
+        if let Some(parent) = self.parents.remove(&node) {
+            if let Some(children) = self.children.get_mut(&parent) {
+                let mut i = 0;
+                while i < children.len() {
+                    if children[i] == node {
+                        children.remove(i);
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Returns the children for the given node.
+    pub fn get_children(&self, node: Node) -> Option<&[Node]> {
+        self.children.get(&node).map(Vec::as_slice)
     }
 
     /// Adds the component to the node.
@@ -161,11 +221,7 @@ impl Scene {
             Some(index) => index,
             None => {
                 let index = self.component_tables.len();
-                self.component_indexes.push(ComponentIndex {
-                    type_id: TypeId::of::<T>(),
-                    index,
-                });
-                self.component_indexes.sort_by_key(|c| c.type_id);
+                self.component_indexes.insert(TypeId::of::<T>(), index);
                 self.component_tables
                     .push(Box::new(ComponentTable::<T>::new()));
 
@@ -217,10 +273,7 @@ impl Scene {
     }
 
     fn component_index<T: Component>(&self) -> Option<usize> {
-        self.component_indexes
-            .binary_search_by_key(&TypeId::of::<T>(), |c| c.type_id)
-            .map(|index| self.component_indexes[index].index)
-            .ok()
+        self.component_indexes.get(&TypeId::of::<T>()).copied()
     }
 }
 
@@ -237,6 +290,24 @@ mod tests {
         let node = scene.spawn();
 
         assert!(scene.contains(node));
+    }
+
+    #[test]
+    fn spawn_get_parent_returns_none() {
+        let mut scene = Scene::new();
+
+        let node = scene.spawn();
+
+        assert_eq!(scene.get_parent(node), None);
+    }
+
+    #[test]
+    fn spawn_get_children_returns_none() {
+        let mut scene = Scene::new();
+
+        let node = scene.spawn();
+
+        assert_eq!(scene.get_children(node), None);
     }
 
     #[test]
@@ -259,6 +330,66 @@ mod tests {
     }
 
     #[test]
+    fn despawn_get_parent_returns_none() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.despawn(node);
+
+        assert_eq!(scene.get_parent(node), None);
+    }
+
+    #[test]
+    fn despawn_get_children_returns_none() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.despawn(node);
+
+        assert_eq!(scene.get_children(node), None);
+    }
+
+    #[test]
+    fn despawn_parent_contains_returns_false() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.despawn(parent);
+
+        assert!(!scene.contains(node));
+    }
+
+    #[test]
+    fn despawn_parent_get_parent_returns_none() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.despawn(parent);
+
+        assert_eq!(scene.get_parent(node), None);
+    }
+
+    #[test]
+    fn despawn_parent_get_children_returns_none() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.despawn(parent);
+
+        assert_eq!(scene.get_children(node), None);
+    }
+
+    #[test]
     fn despawn_get_returns_none() {
         let mut scene = Scene::new();
         let node = scene.spawn();
@@ -268,6 +399,78 @@ mod tests {
         scene.despawn(node);
 
         assert_eq!(scene.get::<u32>(node), None);
+    }
+
+    #[test]
+    fn set_parent_get_parent_returns_parent() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+
+        scene.set_parent(node, parent);
+
+        assert_eq!(scene.get_parent(node), Some(parent));
+    }
+
+    #[test]
+    fn set_parent_get_children_returns_node() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+
+        scene.set_parent(node, parent);
+
+        assert_eq!(scene.get_children(parent), Some([node].as_slice()));
+    }
+
+    #[test]
+    fn set_parent_removed_node_get_parent_returns_previous_parent() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        let despawned = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.despawn(despawned);
+        scene.set_parent(node, despawned);
+
+        assert_eq!(scene.get_parent(node), Some(parent));
+    }
+
+    #[test]
+    fn set_parent_self_get_parent_returns_previous_parent() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.set_parent(node, node);
+
+        assert_eq!(scene.get_parent(node), Some(parent));
+    }
+
+    #[test]
+    fn set_parent_child_get_parent_returns_none() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.set_parent(parent, node);
+
+        assert_eq!(scene.get_parent(parent), None);
+    }
+
+    #[test]
+    fn remove_parent_get_parent_returns_none() {
+        let mut scene = Scene::new();
+        let parent = scene.spawn();
+        let node = scene.spawn();
+        scene.set_parent(node, parent);
+
+        scene.remove_parent(node);
+
+        assert_eq!(scene.get_parent(node), None);
     }
 
     #[test]
