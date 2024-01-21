@@ -12,6 +12,13 @@ static ALLOCATOR: AtomicUsize = AtomicUsize::new(1);
 /// # Component
 pub trait Component: 'static + Clone {}
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ComponentEvent {
+    Added(Node),
+    Modified(Node),
+    Removed(Node),
+}
+
 /// # Node
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Node {
@@ -34,11 +41,16 @@ trait DynamicComponentTable {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn remove(&mut self, node: Node);
+
+    fn events(&self) -> &[ComponentEvent];
+
+    fn clear_events(&mut self);
 }
 
 struct ComponentTable<T> {
     node_indexes: IntMap<Node, usize>,
     items: Vec<T>,
+    events: Vec<ComponentEvent>,
 }
 
 impl<T> ComponentTable<T> {
@@ -46,6 +58,7 @@ impl<T> ComponentTable<T> {
         Self {
             node_indexes: IntMap::default(),
             items: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -54,6 +67,7 @@ impl<T> ComponentTable<T> {
             let index = self.items.len();
             self.node_indexes.insert(node, index);
             self.items.push(value);
+            self.events.push(ComponentEvent::Added(node));
         }
     }
 
@@ -66,11 +80,13 @@ impl<T> ComponentTable<T> {
     fn set(&mut self, node: Node, value: T) {
         if let Some(index) = self.node_indexes.get(&node) {
             self.items[*index] = value;
+            self.events.push(ComponentEvent::Modified(node));
         }
     }
 
     fn remove(&mut self, node: Node) {
         if let Some(index) = self.node_indexes.remove(&node) {
+            self.events.push(ComponentEvent::Removed(node));
             self.items.swap_remove(index);
 
             let moved_index = self.items.len();
@@ -83,6 +99,14 @@ impl<T> ComponentTable<T> {
                 }
             }
         }
+    }
+
+    fn events(&self) -> &[ComponentEvent] {
+        &self.events
+    }
+
+    fn clear_events(&mut self) {
+        self.events.clear();
     }
 }
 
@@ -97,6 +121,14 @@ impl<T: Component> DynamicComponentTable for ComponentTable<T> {
 
     fn remove(&mut self, node: Node) {
         self.remove(node);
+    }
+
+    fn events(&self) -> &[ComponentEvent] {
+        self.events()
+    }
+
+    fn clear_events(&mut self) {
+        self.clear_events();
     }
 }
 
@@ -273,6 +305,22 @@ impl Scene {
                 .downcast_mut::<ComponentTable<T>>()
                 .unwrap()
                 .remove(node);
+        }
+    }
+
+    /// Returns the component events for the given component.
+    pub fn events<T: Component>(&self) -> &[ComponentEvent] {
+        if let Some(component_index) = self.component_index::<T>() {
+            self.component_tables[component_index].events()
+        } else {
+            &[]
+        }
+    }
+
+    /// Clears the component events for all the components.
+    pub fn clear_events(&mut self) {
+        for table in &mut self.component_tables {
+            table.clear_events();
         }
     }
 
@@ -489,6 +537,17 @@ mod tests {
     }
 
     #[test]
+    fn add_events_returns_added_event() {
+        let mut scene = Scene::new();
+        let node = scene.spawn();
+        let value = 17u32;
+
+        scene.add(node, value);
+
+        assert_eq!(scene.events::<u32>(), &[ComponentEvent::Added(node)]);
+    }
+
+    #[test]
     fn set_get_returns_new_value() {
         let mut scene = Scene::new();
         let node = scene.spawn();
@@ -502,6 +561,22 @@ mod tests {
     }
 
     #[test]
+    fn set_events_returns_modified_event() {
+        let mut scene = Scene::new();
+        let node = scene.spawn();
+        let value = 17u32;
+        scene.add(node, value);
+
+        let new_value = 192u32;
+        scene.set(node, new_value);
+
+        assert_eq!(
+            scene.events::<u32>(),
+            &[ComponentEvent::Added(node), ComponentEvent::Modified(node)]
+        );
+    }
+
+    #[test]
     fn remove_get_returns_none() {
         let mut scene = Scene::new();
         let node = scene.spawn();
@@ -511,5 +586,32 @@ mod tests {
         scene.remove::<u32>(node);
 
         assert_eq!(scene.get::<u32>(node), None);
+    }
+
+    #[test]
+    fn remove_events_returns_removed_event() {
+        let mut scene = Scene::new();
+        let node = scene.spawn();
+        let value = 17u32;
+        scene.add(node, value);
+
+        scene.remove::<u32>(node);
+
+        assert_eq!(
+            scene.events::<u32>(),
+            &[ComponentEvent::Added(node), ComponentEvent::Removed(node)]
+        );
+    }
+
+    #[test]
+    fn clear_events_events_returns_empty() {
+        let mut scene = Scene::new();
+        let node = scene.spawn();
+        let value = 17u32;
+        scene.add(node, value);
+
+        scene.clear_events();
+
+        assert_eq!(scene.events::<u32>(), &[]);
     }
 }
