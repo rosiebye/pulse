@@ -1,3 +1,6 @@
+[workspace]
+members = ["examples/playground"]
+
 [package]
 name = "pulse"
 version = "0.1.0"
@@ -10,3 +13,4 @@ repository = "https://github.com/rosiebye/pulse"
 publish = false
 
 [dependencies]
+winit = "0.29.10"
