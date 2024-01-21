@@ -1,9 +1,11 @@
 use std::any::Any;
 use std::any::TypeId;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+
+use nohash::IntMap;
+use nohash::IntSet;
 
 static ALLOCATOR: AtomicUsize = AtomicUsize::new(1);
 
@@ -24,6 +26,8 @@ impl Node {
     }
 }
 
+impl nohash::IsEnabled for Node {}
+
 trait DynamicComponentTable {
     fn as_any(&self) -> &dyn Any;
 
@@ -33,14 +37,14 @@ trait DynamicComponentTable {
 }
 
 struct ComponentTable<T> {
-    node_indexes: BTreeMap<Node, usize>,
+    node_indexes: IntMap<Node, usize>,
     items: Vec<T>,
 }
 
 impl<T> ComponentTable<T> {
     fn new() -> Self {
         Self {
-            node_indexes: BTreeMap::new(),
+            node_indexes: IntMap::default(),
             items: Vec::new(),
         }
     }
@@ -98,20 +102,20 @@ impl<T: Component> DynamicComponentTable for ComponentTable<T> {
 
 /// # Scene
 pub struct Scene {
-    nodes: BTreeSet<Node>,
-    parents: BTreeMap<Node, Node>,
-    children: BTreeMap<Node, Vec<Node>>,
+    nodes: IntSet<Node>,
+    parents: IntMap<Node, Node>,
+    children: IntMap<Node, Vec<Node>>,
     component_indexes: BTreeMap<TypeId, usize>,
     component_tables: Vec<Box<dyn DynamicComponentTable>>,
 }
 
 impl Scene {
     /// Returns an empty scene.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            nodes: BTreeSet::new(),
-            parents: BTreeMap::new(),
-            children: BTreeMap::new(),
+            nodes: IntSet::default(),
+            parents: IntMap::default(),
+            children: IntMap::default(),
             component_indexes: BTreeMap::new(),
             component_tables: Vec::new(),
         }
@@ -144,9 +148,9 @@ impl Scene {
     }
 
     fn despawn_internal(
-        nodes: &mut BTreeSet<Node>,
-        parents: &mut BTreeMap<Node, Node>,
-        children: &mut BTreeMap<Node, Vec<Node>>,
+        nodes: &mut IntSet<Node>,
+        parents: &mut IntMap<Node, Node>,
+        children: &mut IntMap<Node, Vec<Node>>,
         component_tables: &mut Vec<Box<dyn DynamicComponentTable>>,
         node: Node,
     ) {
